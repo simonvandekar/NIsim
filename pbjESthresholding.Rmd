@@ -1,0 +1,246 @@
+---
+title: "Documentation for running pbj simulations on AWS"
+author: "Simon Vandekar"
+date: "2/7/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(GPs=function(before, options, envir){
+  if (before){
+    cex=1.5
+    par(mgp=c(1.7,.7,0), lwd=1.5, lend=2,
+        cex.lab=0.8*cex, cex.axis=0.8*cex, cex.main=1*cex,
+        mar=c(2.8,2.8,1.8,.2), bty='l', oma=c(0,0,2,0))}
+})
+knitr::opts_chunk$set(echo = FALSE, fig.height = 4, fig.width = 4, GPs=TRUE, cache=TRUE)
+path = Sys.getenv('PATH')
+path = Sys.setenv('PATH'=paste(path, '/home/rstudio/.local/bin', sep=':'))
+set.seed(555)
+```
+
+## AWS machine image setup
+
+I use the directions [here](https://jagg19.github.io/2019/08/aws-r/#short-easy) to create an AMI to run Rstudio on.
+The `Welcome.R` script in the [NIsim](https://github.com/simonvandekar/NIsim) package has code to setup this machine image with Dropbox access to the files.
+
+
+## Setup simulations
+
+```{r simconfig}
+# install the latest versions of the packages to perform these analyses.
+devtools::install_github('simonvandekar/pbj', ref='ftest')
+#devtools::install_github('simonvandekar/NIsim')
+### LIBRARIES ###
+library(RNifti)
+library(parallel)
+library(splines)
+library(mmand)
+library(fslr)
+library(progress)
+library(abind)
+library(pbj)
+library(PDQutils)
+library(NIsim)
+
+
+
+### LOAD IN DATA FROM DROPBOX ###
+dbimagedir = '~/pbj/data/abide/neuroimaging/cpac/alff'
+dbresimagedir = '~/pbj/data/abide/neuroimaging/cpac/alff_res'
+maskfile = '~/pbj/data/abide/neuroimaging/cpac/n1035_mask.nii.gz'
+templatefile = '~/pbj/data/abide/neuroimaging/MNI152_T1_3mm.nii.gz'
+#dbimagedir = '~/pbj/data/abide/neuroimaging/cpac/alff_cropped/'
+#dbresimagedir = '~/pbj/data/abide/neuroimaging/cpac/alff_cropped_res/'
+#maskfile = '~/pbj/data/abide/neuroimaging/cpac/cropped_n1035_mask.nii.gz'
+dbdatafile = '~/pbj/data/abide/demographic/n1035_phenotypic_20190509.rds'
+
+
+# load in data and get directories
+dat = readRDS(dbdatafile)
+dat$imgname = paste(dat$file_id, 'alff.nii.gz', sep='_')
+dat$files = file.path(dbimagedir, dat$imgname)
+
+
+
+### SIMULATION PARAMETERS ###
+simConfig = list(
+  # vector of sample sizes to simulate
+  ns = 25 * 2^(0:5),
+  # number of simulations to run
+  nsim=10000,
+  # cluster forming thresholds
+  cfts.s = c(0.1, 0.25, 0.4),
+  cfts.p = c(0.05, 0.01, 0.001),
+  
+  # radius for spheres of signal.
+  rs=c(8),
+  
+  #### MODEL FORMULAS FOR SIMULATIONS ####
+  formres = paste0(" ~ dx_group + sex + ns(func_mean_fd, df=10) + ns(age_at_scan, df=10)" ),
+  # need age_at_scan in both models for testing nonlinear functions
+  form = paste0(" ~ sex + func_mean_fd + dx_group + age_at_scan" ),
+  formred = paste0(" ~ sex + func_mean_fd + dx_group"),
+  #  weights for each subject. Can be a character vector
+  W = c("func_mean_fd"),
+  # where to put residuals
+  resdir = dbresimagedir,
+  # where to output results
+  simdir = '~/temp',
+  dat = dat,
+  mask = maskfile,
+  output = '~/pbj/pbj_ftest/EST.rdata',
+  ncores = 24,
+  method='bootstrap'
+)
+simConfig$betas = rep(0, length(simConfig$rs))
+```
+
+# Simulation functions
+```{r simulationFunctions}
+simFunc = function(lmfull, lmred, mask, data){
+  HC3RobustStatmap = lmPBJ(data$images, form=lmfull, formred=lmred, mask=mask, data=data, transform = 'none', HC3 = TRUE )
+  # t transform, classical, estimate covariance
+  tStatmap = lmPBJ(data$images, form=lmfull, formred=lmred, mask=mask, data=data, transform = 't', robust=FALSE, HC3=TRUE)
+  out = list('tStatmap' = tStatmap$stat, 'HC3RobustStatmap'=HC3RobustStatmap$stat)
+  gc()
+  return(out)
+}
+
+#simdirs = simSetup(simConfig$dat$files, data=simConfig$dat, outdir=simConfig$simdir, nsim=simConfig$nsim, #ns=simConfig$ns, mask=simConfig$mask, rs=simConfig$rs, betas=simConfig$betas )
+#simtime = system.time(test <- simFunc(simConfig$form, simConfig$formred, simConfig$mask, readRDS(file.path(simdirs$simdir[200], 'data.rds')), 2, cfts.p = simConfig$cfts.p))
+#stop('not an error.')
+#simFunc(simConfig$form, simConfig$formred, simConfig$mask, readRDS(file.path(simdirs$simdir[200], 'data.rds')))
+```
+
+# Run simulations
+```{r runSims}
+### SETUP THE SIMULATION ANALYSIS ###
+# subsets dataset to all people who have the variables
+simConfig$dat = simConfig$dat[apply(!is.na(simConfig$dat[ ,c(all.vars(as.formula(simConfig$formres)), simConfig$W)]), 1, all), ]
+# # Create residualized images
+# if(class(simConfig$formres)=='formula' | is.character(simConfig$formres)){
+#   simConfig$dat$rfiles = file.path(simConfig$resdir, basename(simConfig$dat$files))
+#   if(!all(file.exists(simConfig$dat$rfiles))){
+#     pbj::residualizeImages(files=simConfig$dat$files, dat=simConfig$dat, mask=simConfig$mask, form=as.formula(simConfig$formres), outfiles=simConfig$dat$rfiles, mc.cores=simConfig$ncores)
+#   }
+#   simConfig$dat$files = simConfig$dat$rfiles
+#   # clean up. May not be necessary
+#   gc()
+# }
+
+simdirs = simSetup(simConfig$dat$files, data=simConfig$dat, outdir=simConfig$simdir, nsim=simConfig$nsim, ns=simConfig$ns, mask=simConfig$mask, rs=simConfig$rs, betas=simConfig$betas )
+
+
+#time = system.time(test <- simFunc(simConfig$form, simConfig$formred, simConfig$mask, readRDS(file.path(simdirs$simdir[10], 'data.rds')), simConfig$nboot, simConfig$cfts.s) )
+
+# mix this up so that large sample simulations aren't all dropped on one "thread".
+simdirs = simdirs[sample(1:nrow(simdirs)),]
+
+
+results = runSim(simdirs$simdir, method=simConfig$method,
+                 simfunc = simFunc, mask = simConfig$mask,
+                 simfuncArgs = list(
+                   lmfull= simConfig$form,
+                   lmred = simConfig$formred,
+                   mask = simConfig$mask), ncores = simConfig$ncores)
+
+dir.create(dirname(simConfig$output), showWarnings = FALSE, recursive = TRUE)
+# clean up files
+save.image(file=simConfig$output)
+unlink(list.files(tempdir(), full.names = TRUE))
+gc()
+
+stop('not an error. Finished simulations.')
+```
+
+
+## Draw image results
+
+```{r, figure1images}
+# also sets up the data frame with the output
+slice = 30
+cex = 1.5
+
+# initialize output for loop
+blankimg = mask = readNifti(maskfile)
+blankimg[,,] = 0
+template = readNifti(templatefile)
+
+npns = c(length(simConfig$cfts.p), length(simConfig$cfts.s))
+allimgout = data.frame(method=rep(c('p-value', 'S value'), npns * length(simConfig$ns)), n=rep(simConfig$ns, sum(npns)), value = c(rep(simConfig$cfts.p, each=length(simConfig$ns)), rep(simConfig$cfts.s, each=length(simConfig$ns))), power=NA, mean=NA)
+load(simConfig$output)
+simdirs$results = results
+for(rowInd in 1:nrow(allimgout)){
+  cat(rowInd, '\n')
+  n = allimgout[rowInd, 'n']
+  method = allimgout[rowInd, 'method']
+  value = allimgout[rowInd, 'value']
+  
+  design = pbj::getDesign(simConfig$form, simConfig$formred, data=simConfig$dat)
+  if(method=='p-value'){
+    chisqValue = qchisq(value, df=design$df, lower.tail=FALSE)
+  } else {
+    #chisqValue = value^2*(n-ncol(design$X)) + design$df
+    chisqValue = value^2*(n) + design$df
+  }
+  
+   # Tstatmap
+   blankimg[ mask==1] = rowMeans(simplify2array(lapply(simdirs$results[simdirs$n==n], function(x) x$tStatmap ))>=chisqValue)
+   allimgout$tStatmapPower[rowInd] = list(blankimg)
+   blankimg[,,] = 0
+   temp = simplify2array(lapply(simdirs$results[simdirs$n==n], function(x) x$tStatmap ))
+   temp[ is.infinite(temp)] = max(temp[is.finite(temp)])
+   blankimg[ mask==1] = rowMeans(temp)
+   allimgout$tStatmapMean[rowInd] = list(blankimg)
+   rm(temp)
+   image(blankimg, template, thresh=chisqValue, index=slice, cex=cex*0.7)
+   title(paste(method, '=', value, ', n', '=', n, ', T-stat'))
+   
+   # Robust statmap
+   blankimg[,,] = 0
+   blankimg[ mask==1] = rowMeans(simplify2array(lapply(simdirs$results[simdirs$n==n], function(x) x$HC3RobustStatmap ))>=chisqValue)
+   allimgout$robustStatmapPower[rowInd] = list(blankimg)
+   blankimg[,,] = 0
+   temp = simplify2array(lapply(simdirs$results[simdirs$n==n], function(x) x$HC3RobustStatmap ))
+   temp[ is.infinite(temp)] = max(temp[is.finite(temp)])
+   blankimg[ mask==1] = rowMeans(temp)
+   allimgout$robustStatmapMean[rowInd] = list(blankimg)
+   rm(temp)
+}
+
+sapply(allimgout[ allimgout$value==0.25, 'robustStatmapMean'], function(x){x = x[,,30]; mask=mask[,,30]; quantile(x[ mask==1]) } )
+0.25^2*(simConfig$ns-ncol(design$X)) + design$df
+```
+
+
+
+```{r figure1images2, fig.width=12, fig.height=5}
+subimgout = allimgout[(allimgout$method=='p-value' & allimgout$value==0.001) | (allimgout$method=='S value' & allimgout$value==0.25),]
+
+# graphical parameters
+par(mgp=c(1.7,.7,0), lwd=1.5, lend=2,
+        cex.lab=0.8*cex, cex.axis=0.8*cex, cex.main=1*cex,
+        mar=c(0.5,0.5,3,.5), bty='l', oma=c(0,0,2,0))
+layout(matrix(1:12, nrow=2, byrow=TRUE))
+for(rowInd in 1:nrow(subimgout)){
+  cat(rowInd, '\n')
+  n = subimgout[rowInd, 'n']
+  method = subimgout[rowInd, 'method']
+  value = subimgout[rowInd, 'value']
+  
+  design = pbj::getDesign(simConfig$form, simConfig$formred, data=simConfig$dat)
+  if(method=='p-value'){
+    chisqValue = qchisq(value, df=design$df, lower.tail=FALSE)
+  } else {
+    #chisqValue = value^2*(n-ncol(design$X)) + design$df
+    chisqValue = value^2*(n) + design$df
+  }
+  
+  blankimg = subimgout$robustStatmapMean[[rowInd]]
+  image(blankimg, template, thresh=chisqValue, index=slice, cex=cex*0.7)
+  title(paste0(method, '=', value, ', n=', n, ',\nZ-stat'))
+}
+mtext
+```
+
